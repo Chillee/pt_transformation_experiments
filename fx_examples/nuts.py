@@ -135,7 +135,7 @@ Note that we are jit compiling the integrator which includes grad computation.
 
 # Run only once in a loop; otherwise the best number reported
 # does not include compilation time.
-D = 1
+D = 100
 step_size = 0.001
 seed = 0
 
@@ -143,7 +143,7 @@ jax_fn = get_jax_fn(D, step_size, seed)
 begin = time.time()
 # for _ in range(9):
 jax_fn()
-# print(jax_fn()['z'][0][0])
+print(jax_fn()['z'][0][0])
 print("jax time: ", time.time()-begin)
 
 
