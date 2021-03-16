@@ -24,13 +24,11 @@ from opacus.utils.module_modification import convert_batchnorm_modules
 from torchvision.datasets import CIFAR10
 from tqdm import tqdm
 
-from functools import partial
-from make_functional import make_functional, load_weights
-
-# NB: The following might not exist depending on what you're using
 from torch import vmap
+from make_functional import make_functional, load_weights
 from functional_utils import grad, grad_with_value
-
+from functools import partial
+# from resnet import resnet18
 
 def save_checkpoint(state, is_best, filename="checkpoint.tar"):
     torch.save(state, filename)
@@ -42,6 +40,32 @@ def accuracy(preds, labels):
     return (preds == labels).mean()
 
 
+def compute_norms(sample_grads):
+    batch_size = sample_grads[0].shape[0]
+    norms = [sample_grad.view(batch_size, -1).norm(2, dim=-1) for sample_grad in sample_grads]
+    norms = torch.stack(norms, dim=0).norm(2, dim=0)
+    return norms
+
+def clip_and_accumulate_and_add_noise(sample_grads, max_per_sample_grad_norm=1.0, noise_multiplier=1.0):
+    # step 0: compute the norms
+    sample_norms = compute_norms(sample_grads)
+
+    # step 1: compute clipping factors
+    clip_factor = max_per_sample_grad_norm / (sample_norms + 1e-6)
+    clip_factor = clip_factor.clamp(max=1.0)
+
+    # step 2: clip
+    grads = tuple(torch.einsum('i,i...', clip_factor, sample_grad)
+                  for sample_grad in sample_grads)
+
+    # step 3: add gaussian noise
+    stddev = max_per_sample_grad_norm * noise_multiplier
+    noises = tuple(torch.normal(0, stddev, grad_param.shape, device=grad_param.device)
+                   for grad_param in grads)
+    grads = tuple(noise + grad_param for noise, grad_param in zip(noises, grads))
+
+    return grads
+
 def train(args, model, train_loader, optimizer, epoch, device):
     model.train()
     criterion = nn.CrossEntropyLoss()
@@ -50,47 +74,51 @@ def train(args, model, train_loader, optimizer, epoch, device):
     top1_acc = []
 
     for i, (images, target) in enumerate(tqdm(train_loader)):
+
         images = images.to(device)
         target = target.to(device)
 
         # Step 1: compute per-sample-grads
-
-        # TODO(rzou): does the group norm work correctly?
         weights, func_model, descriptors = make_functional(model)
-        [weight.requires_grad_(False) for weight in weights]
 
         def compute_loss_and_output(weights, image, target):
             images = image.unsqueeze(0)
-            target = target.unsqueeze(0)
+            targets = target.unsqueeze(0)
             output = func_model(weights, (images,))
-            loss = criterion(output, target)
+            loss = criterion(output, targets)
             return loss, output.squeeze(0)
 
+        # grad_with_value(f) returns a function that returns (1) the grad and
+        # (2) the output. `has_aux=True` means that `f` returns a tuple of two values,
+        # where the first is to be differentiated and the second is not to be
+        # differentiated and further adds a 3rd output.
+        #
+        # We need to use `grad_with_value(..., has_aux=True)` because we do
+        # some analyses on the returned loss and output.
         grads_loss_output = grad_with_value(compute_loss_and_output, has_aux=True)
-        grads, sample_loss, output = vmap(partial(grads_loss_output, weights))(images, target)
-        loss = sample_loss.mean(0)
+        sample_grads, sample_loss, output = vmap(partial(grads_loss_output, weights))(images, target)
+        loss = sample_loss.mean()
 
-        # Step 2: Clip the per-sample-grads and sum them to form grads
-
-        # TODO(rzou): Right now we just sum the grads. Instead we need to clip them.
-        for sample_grad, weight in zip(grads, weights):
-            weight_grad = sample_grad.sum(0)
-            weight.grad = weight_grad
+        # Step 2: Clip the per-sample-grads, sum them to form grads, and add noise
+        grads = clip_and_accumulate_and_add_noise(
+            sample_grads, args.max_per_sample_grad_norm, args.sigma)
 
         # `load_weights` is the inverse operation of make_functional. We put
         # things back into a model so that we can directly apply optimizers.
         # TODO(rzou): this might not be necessary, optimizers just take
         # the params straight up.
-        [weight.requires_grad_(True) for weight in weights]
-        load_weights(model, descriptors, weights, as_params=True)
+        load_weights(model, descriptors, weights)
+
+        for weight_grad, weight in zip(grads, model.parameters()):
+            weight.grad = weight_grad.detach()
 
         preds = np.argmax(output.detach().cpu().numpy(), axis=1)
         labels = target.detach().cpu().numpy()
+        losses.append(loss.item())
 
         # measure accuracy and record loss
         acc1 = accuracy(preds, labels)
 
-        losses.append(loss.item())
         top1_acc.append(acc1)
         stats.update(stats.StatType.TRAIN, acc1=acc1)
 
@@ -103,23 +131,11 @@ def train(args, model, train_loader, optimizer, epoch, device):
             optimizer.virtual_step()
 
         if i % args.print_freq == 0:
-            if not args.disable_dp:
-                epsilon, best_alpha = optimizer.privacy_engine.get_privacy_spent(
-                    args.delta
-                )
-                print(
-                    f"\tTrain Epoch: {epoch} \t"
-                    f"Loss: {np.mean(losses):.6f} "
-                    f"Acc@1: {np.mean(top1_acc):.6f} "
-                    f"(ε = {epsilon:.2f}, δ = {args.delta}) for α = {best_alpha}"
-                )
-            else:
-                print(
-                    f"\tTrain Epoch: {epoch} \t"
-                    f"Loss: {np.mean(losses):.6f} "
-                    f"Acc@1: {np.mean(top1_acc):.6f} "
-                )
-
+            print(
+                f"\tTrain Epoch: {epoch} \t"
+                f"Loss: {np.mean(losses):.6f} "
+                f"Acc@1: {np.mean(top1_acc):.6f} "
+            )
 
 def test(args, model, test_loader, device):
     model.eval()
@@ -175,10 +191,11 @@ def main():
     parser.add_argument(
         "-b",
         "--batch-size",
-        default=256,
+        # This should be 256, but that OOMs using the prototype.
+        default=64,
         type=int,
         metavar="N",
-        help="mini-batch size (default: 256), this is the total "
+        help="mini-batch size (default: 64), this is the total "
         "batch size of all GPUs on the current node when "
         "using Data Parallel or Distributed Data Parallel",
     )
@@ -384,6 +401,7 @@ def main():
     best_acc1 = 0
     device = torch.device(args.device)
     model = convert_batchnorm_modules(models.resnet18(num_classes=10))
+    # model = CIFAR10Model()
     model = model.to(device)
 
     if args.optim == "SGD":
