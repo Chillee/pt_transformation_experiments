@@ -24,9 +24,8 @@ from opacus.utils.module_modification import convert_batchnorm_modules
 from torchvision.datasets import CIFAR10
 from tqdm import tqdm
 
-from torch import vmap
 from make_functional import make_functional, load_weights
-from functional_utils import grad, grad_with_value
+from torch.eager_transforms import vmap, grad_with_value
 from functools import partial
 # from resnet import resnet18
 

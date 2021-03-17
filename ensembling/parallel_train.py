@@ -2,8 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import vmap
-from functional_utils import make_functional, grad_with_value
+from torch.eager_transforms import make_functional, grad_with_value, vmap
 
 # Adapted from http://willwhitney.com/parallel-training-jax.html
 # GOAL: Demonstrate that it is possible to use eager-mode vmap
