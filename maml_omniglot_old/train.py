@@ -85,7 +85,7 @@ def run_task(update_lr, update_step, params, buffers, net,
         # Train the model w.r.t spt input
         logits = net(new_params, buffers, (x_spt,))
         loss = F.cross_entropy(logits, y_spt)
-        grads = torch.autograd.grad(loss, new_params)
+        grads = torch.autograd.grad(loss, new_params, create_graph=True)
         new_params = [param - update_lr * param_grad
                       for param_grad, param in zip(grads, new_params)]
 
