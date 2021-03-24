@@ -56,6 +56,8 @@ def main():
     argparser.add_argument(
         '--k_qry', type=int, help='k shot for query set', default=15)
     argparser.add_argument(
+        '--device', type=str, help='device', default='cuda')
+    argparser.add_argument(
         '--task_num',
         type=int,
         help='meta batch size, namely task num',
@@ -69,7 +71,7 @@ def main():
     np.random.seed(args.seed)
 
     # Set up the Omniglot loader.
-    device = torch.device('cuda')
+    device = args.device
     db = OmniglotNShot(
         '/tmp/omniglot-data',
         batchsz=args.task_num,

@@ -43,6 +43,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.optim as optim
+
+"""
+This runs off of the prototype on the zou3519/pytorch:dynlayer branch.
+"""
 from torch.eager_transforms import make_functional_with_buffers, vmap, grad
 
 import higher
@@ -86,7 +90,8 @@ def main():
     )
 
     # Create a vanilla PyTorch neural network.
-    # TODO: inplace relu doesn't work on the prototype bc shenanigans
+    # TODO: The prototype doesn't support in-place relu (and some other
+    # in-place operations. That can be fixed.)
     inplace_relu = False
     net = nn.Sequential(
         nn.Conv2d(1, 64, 3),
@@ -106,7 +111,9 @@ def main():
 
     net.train()
 
-    # Make the module functional!
+    # Given this module we've created, rip out the parameters and buffers
+    # and return a functional version of the module. `fnet` is stateless
+    # and can be called with `fnet(params, buffers, args, kwargs)`
     params, buffers, fnet, _, _, = make_functional_with_buffers(net)
 
     # We will use Adam to (meta-)optimize the initial parameters
@@ -120,6 +127,8 @@ def main():
         plot(log)
 
 
+# Trains a model for n_inner_iter using the support and returns a loss
+# using the query.
 def loss_for_task(net, n_inner_iter, x_spt, y_spt, x_qry, y_qry):
     params, buffers, fnet = net
     querysz = x_qry.size(0)
@@ -132,7 +141,7 @@ def loss_for_task(net, n_inner_iter, x_spt, y_spt, x_qry, y_qry):
     new_params = params
     for _ in range(n_inner_iter):
         grads = grad(compute_loss)(new_params, buffers, x_spt, y_spt)
-        new_params = [p - g * 1e-3 for p, g, in zip(new_params, grads)]
+        new_params = [p - g * 1e-1 for p, g, in zip(new_params, grads)]
 
     # The final set of adapted parameters will induce some
     # final loss and accuracy on the query dataset.
@@ -159,9 +168,12 @@ def train(db, net, device, meta_opt, epoch, log):
         n_inner_iter = 5
         meta_opt.zero_grad()
 
-        # Train on each task and compute a loss using the final weights and query
+        # In parallel, trains one model per task. There is a support (x, y)
+        # for each task and a query (x, y) for each task.
         compute_loss_for_task = functools.partial(loss_for_task, net, n_inner_iter)
         qry_losses, qry_accs = vmap(compute_loss_for_task)(x_spt, y_spt, x_qry, y_qry)
+
+        # Compute the maml loss by summing together the returned losses.
         qry_losses.sum().backward()
 
         meta_opt.step()
@@ -209,7 +221,7 @@ def test(db, net, device, epoch, log):
                 spt_logits = fnet(new_params, buffers, (x_spt[i],))
                 spt_loss = F.cross_entropy(spt_logits, y_spt[i])
                 grads = torch.autograd.grad(spt_loss, new_params)
-                new_params = [p - g * 1e-3 for p, g, in zip(new_params, grads)]
+                new_params = [p - g * 1e-1 for p, g, in zip(new_params, grads)]
 
             # The query loss and acc induced by these parameters.
             qry_logits = fnet(new_params, buffers, (x_qry[i],)).detach()

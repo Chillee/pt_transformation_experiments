@@ -57,6 +57,8 @@ def main():
     argparser.add_argument(
         '--k_qry', type=int, help='k shot for query set', default=15)
     argparser.add_argument(
+        '--device', type=str, help='device', default='cuda')
+    argparser.add_argument(
         '--task_num',
         type=int,
         help='meta batch size, namely task num',
@@ -70,7 +72,7 @@ def main():
     np.random.seed(args.seed)
 
     # Set up the Omniglot loader.
-    device = torch.device('cuda')
+    device = args.device
     db = OmniglotNShot(
         '/tmp/omniglot-data',
         batchsz=args.task_num,
@@ -103,10 +105,6 @@ def main():
         nn.Linear(64, args.n_way)).to(device)
 
     net.train()
-
-    # Make the module functional!
-    # TODO(rzou): This model doesn't perform as well as the torch/higher model,
-    # but it still trains. Should investigate the problem.
     params, buffers, fnet, _, _, = make_functional_with_buffers(net)
 
     # We will use Adam to (meta-)optimize the initial parameters
@@ -152,7 +150,7 @@ def train(db, net, device, meta_opt, epoch, log):
                 spt_logits = fnet(new_params, buffers, (x_spt[i],))
                 spt_loss = F.cross_entropy(spt_logits, y_spt[i])
                 grads = torch.autograd.grad(spt_loss, new_params, create_graph=True)
-                new_params = [p - g * 1e-3 for p, g, in zip(new_params, grads)]
+                new_params = [p - g * 1e-1 for p, g, in zip(new_params, grads)]
 
             # The final set of adapted parameters will induce some
             # final loss and accuracy on the query dataset.
@@ -214,7 +212,7 @@ def test(db, net, device, epoch, log):
                 spt_logits = fnet(new_params, buffers, (x_spt[i],))
                 spt_loss = F.cross_entropy(spt_logits, y_spt[i])
                 grads = torch.autograd.grad(spt_loss, new_params)
-                new_params = [p - g * 1e-3 for p, g, in zip(new_params, grads)]
+                new_params = [p - g * 1e-1 for p, g, in zip(new_params, grads)]
 
             # The query loss and acc induced by these parameters.
             qry_logits = fnet(new_params, buffers, (x_qry[i],)).detach()
